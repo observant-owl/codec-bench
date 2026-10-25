@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """codec_bench: measure ClickHouse column codecs on a sample of a MergeTree table. See SPEC.md.
 
-Phase 0 (dry run), Phase 1 (sample table), Phase 2 per column: sizes, read and write benchmark and (optional)
-stability check, Phase 3: markdown report on stdout.
+Phase 0 (dry run), Phase 1 (sample table), Phase 2 per column: sizes, read and write benchmark, codecs outside
+the bounds filtered as early as possible. Results: the log, and a CSV file written column by column.
 """
 import argparse
+import csv
+import fnmatch
 import math
 import os
 import re
@@ -12,6 +14,7 @@ import secrets
 import signal
 import statistics
 import sys
+import tempfile
 import time
 
 PREFIX = "_codec_bench_"
@@ -62,8 +65,6 @@ QUERY_TIMEOUT = 3600    # s; server max_execution_time per statement
 CLIENT_TIMEOUT = QUERY_TIMEOUT + 300  # s; HTTP read timeout. Single-block INSERTs and OPTIMIZE send nothing
                                       # until done, so it must outlast the server limit
 QUERY_LOG_POLL = 2
-STABILITY_PP = 2.0          # max shift of "vs smallest" between the two halves, in percentage points
-STABILITY_CONTENDER = 10.0  # only codecs within this % of the smallest (in either half) can flag a column
 
 MIN_SERIES = 100
 DISK_HEADROOM = 2.0  # merges/OPTIMIZE FINAL temporarily need about double
@@ -296,6 +297,19 @@ def codec_candidates(t):
         out.append(p)
         out += [f"{p}, {g}" for g in GENERAL if g != "NONE"]
     return out
+
+
+def codec_matches(codec, pattern):
+    """Glob match on the whole codec string, case and spaces ignored (`gcd,delta*` matches `GCD, Delta, ZSTD(3)`)."""
+    norm = lambda x: x.replace(" ", "").lower()
+    return fnmatch.fnmatchcase(norm(codec), norm(pattern))
+
+
+def filter_codecs(codecs, include=(), exclude=()):
+    """(kept, excluded): with `include` only codecs matching one of its patterns, minus those matching `exclude`."""
+    keep = lambda c: ((not include or any(codec_matches(c, p) for p in include))
+                      and not any(codec_matches(c, p) for p in exclude))
+    return [c for c in codecs if keep(c)], [c for c in codecs if not keep(c)]
 
 
 def benchable(col):
@@ -680,14 +694,12 @@ def dry_run(db, a):
     sample_cols = sample_columns(cols, bench, t, key_cols, a.sample_all_columns)
     ch.info("sample columns", ", ".join(c["name"] for c in sample_cols))
     sample_b, worst_b = disk_need(t, cols, bench, sorted(key_cols), sample_rows, sample_cols, a.write_runs > 0)
-    if a.stability:
-        worst_b = int(worst_b * 1.5)  # + one half at a time
     policy = db.rows("SELECT policy_name, volume_name, disks FROM system.storage_policies "
                      "WHERE policy_name = {p:String} ORDER BY volume_priority", {"p": t["storage_policy"]})
     free = free_bytes(policy, db.rows("SELECT name, free_space, keep_free_space FROM system.disks"))
     need = (sample_b + worst_b) * DISK_HEADROOM
     msg = (f"need ~{human_bytes(need)} (sample {human_bytes(sample_b)} + largest column table "
-           f"{'incl. stability half ' if a.stability else ''}{human_bytes(worst_b)}, x{DISK_HEADROOM:g}), "
+           f"{human_bytes(worst_b)}, x{DISK_HEADROOM:g}), "
            f"free {human_bytes(free)}")
     (ch.ok if need <= free else ch.fail)("disk", msg)
 
@@ -701,20 +713,29 @@ def dry_run(db, a):
 
     total = 0
     for c in bench:
-        n = len(codec_candidates(c["type"])) + 1
-        total += n
-        ch.info("candidates", f"{c['name']} {c['type']} {c['compression_codec'] or '(default)'}: {n}")
+        kept, excluded = filter_codecs(codec_candidates(c["type"]), a.include_codec, a.exclude_codec)
+        total += len(kept) + 1
+        ch.info("candidates", f"{c['name']} {c['type']} {c['compression_codec'] or '(default)'}: {len(kept) + 1}"
+                + (f" ({len(excluded)} excluded)" if excluded else ""))
     ch.info("candidates", f"{total} in total over {len(bench)} columns (validated by the server in the real run)")
     ch.info("per column", (f"read benchmark: 1 warm-up + {a.read_runs} runs per codec" if a.read_runs
                            else "read benchmark: off")
             + (f"; write benchmark: 1 warm-up + {a.write_runs} runs per codec (1 if the warm-up takes > "
-               f"{WRITE_SLOW_S}s)" if a.write_runs else "; write benchmark: off")
-            + "; stability check: " + ("on (halves A/B)" if a.stability else "off"))
+               f"{WRITE_SLOW_S}s)" if a.write_runs else "; write benchmark: off"))
+    ch.info("bounds", bounds_text(a))
 
     plan = {"host": srv["host"], "version": srv["version"], "scratch_db": scratch_db, "table": t, "columns": cols, "bench": bench,
             "sample_cols": sample_cols, "key": key, "scan_rows": scan, "fraction": frac,
             "sample_rows": sample_rows, "settings": settings}
     return not ch.failed, plan
+
+
+def bounds_text(a):
+    parts = ([f"include {', '.join(a.include_codec)}"] if a.include_codec else []) \
+        + ([f"exclude {', '.join(a.exclude_codec)}"] if a.exclude_codec else []) \
+        + ([f"read >= {a.min_read_mbs:g} MB/s"] if a.min_read_mbs is not None else []) \
+        + ([f"write >= {a.min_write_mbs:g} MB/s (on the warm-up)"] if a.min_write_mbs is not None else [])
+    return "; ".join(parts) or "none"
 
 
 # ---------------------------------------------------------------- Phase 1
@@ -755,24 +776,36 @@ def build_sample(db, w, a, plan):
 
 # ---------------------------------------------------------------- Phase 2
 
-def measure_column(db, w, plan, col, name, sample, sample_rows, read_runs=0, stability=False, write_runs=0):
-    """Sizes (and read/write times, stability) of every codec the server accepts for `col`,
-    measured in table `name` filled from the sample."""
+NO_BOUNDS = {"include": [], "exclude": [], "min_read_mbs": None, "min_write_mbs": None}
+
+
+def mbs(nbytes, ms):
+    """MB/s from bytes and milliseconds (bytes per ms / 1000)."""
+    return nbytes / ms / 1000 if ms else None
+
+
+def measure_column(db, w, plan, col, name, sample, sample_rows, read_runs=0, write_runs=0, bounds=None):
+    """Sizes (and read/write times) of every codec the server accepts for `col`, measured in table `name` filled
+    from the sample. Codecs outside `bounds` are excluded before anything runs (include/exclude patterns), or get
+    `filtered` set and are not run further (read MB/s on the median, write MB/s on the warm-up)."""
+    bounds = {**NO_BOUNDS, **(bounds or {})}
     target = f"{quote_ident(w.database)}.{quote_ident(name)}"
     p = {"db": w.database, "t": name}
     current = f"current {col['compression_codec'] or '(server default)'}"
-    res = {"column": col["name"], "type": col["type"], "current": col["compression_codec"],
-           "rejected": [], "duplicates": [], "variants": [], "rows": 0, "stability": None, "warnings": [], "error": None}
+    res = {"column": col["name"], "type": col["type"], "current": col["compression_codec"], "excluded": [],
+           "rejected": [], "duplicates": [], "variants": [], "rows": 0, "warnings": [], "error": None}
 
     def warn(msg):
         res["warnings"].append(msg)
         log(f"  [WARN] {col['name']}: {msg}")
 
-
     col_ddl, engine_ddl = column_table_body(plan["table"], plan["columns"], col)
     w.create_table(name, col_ddl, engine_ddl)
     labels = {VARIANT.format(0): current}
-    for i, codec in enumerate(codec_candidates(col["type"]), 1):
+    candidates, res["excluded"] = filter_codecs(codec_candidates(col["type"]), bounds["include"], bounds["exclude"])
+    if res["excluded"]:
+        log(f"  [EXCLUDED] {col['name']}: {len(res['excluded'])} codecs by --include-codec/--exclude-codec")
+    for i, codec in enumerate(candidates, 1):
         try:
             w.add_column(name, VARIANT.format(i), col["type"], codec)
             labels[VARIANT.format(i)] = codec
@@ -824,9 +857,21 @@ def measure_column(db, w, plan, col, name, sample, sample_rows, read_runs=0, sta
 
     if read_runs:
         timed("read", *read_benchmark(db, w.database, name, labels, read_runs))
+        if bounds["min_read_mbs"] is not None:
+            for x in res["variants"]:
+                speed = mbs(x["uncompressed"], x.get("read_wall_ms"))
+                if speed is not None and speed < bounds["min_read_mbs"]:
+                    x["filtered"] = f"read {speed:.1f} MB/s < {bounds['min_read_mbs']:g}"
+            out = [x["codec"] for x in res["variants"] if x.get("filtered")]
+            if out:
+                log(f"  [FILTERED] {col['name']}: read < {bounds['min_read_mbs']:g} MB/s: {'; '.join(out)}")
     if write_runs:
+        # read-filtered codecs are not written; the current codec always is (reference)
+        wlabels = {v: label for v, label in labels.items() if v == VARIANT.format(0) or not by_label[label].get("filtered")}
+        uncompressed = {v: by_label[label]["uncompressed"] for v, label in wlabels.items()}
         try:
-            times, slow = write_benchmark(db, w, plan, col, name, labels, write_runs)
+            times, slow, too_slow = write_benchmark(db, w, plan, col, name, wlabels, write_runs, uncompressed,
+                                                    bounds["min_write_mbs"])
         except Exception as e:
             err = column_failure(e)
             if err is None:
@@ -837,36 +882,32 @@ def measure_column(db, w, plan, col, name, sample, sample_rows, read_runs=0, sta
             timed("write", *times)
             res["write_slow"] = [labels[v] for v in labels if v in slow]
             if slow:
-                log(f"  {col['name']}: measured once (warm-up > {WRITE_SLOW_S}s): {', '.join(res['write_slow'])}")
-    if stability:
-        try:
-            res["stability"] = st = stability_check(db, w, plan, name, labels, fill_args, fill_exprs, sample)
-        except Exception as e:
-            err = column_failure(e)
-            if err is None:
-                raise
-            res["stability"] = {"error": f"code {err[0]}: {err[1]}"}
-            log(f"  [FAIL] {col['name']}: stability check: code {err[0]}: {err[1]}; sizes and read times kept")
-        else:
-            for label, pp in st["shift"].items():
-                by_label[label]["shift"] = pp
-            log(f"  {col['name']}: stability {stability_summary(st)}")
-            if st["unstable"]:
-                log(f"  [UNSTABLE] {col['name']}: " + "; ".join(st["reasons"]))
+                log(f"  {col['name']}: measured once (warm-up > {WRITE_SLOW_S}s): {'; '.join(res['write_slow'])}")
+            for v, speed in too_slow.items():
+                by_label[labels[v]]["filtered"] = f"write {speed:.1f} MB/s < {bounds['min_write_mbs']:g} (warm-up)"
+            if too_slow:
+                log(f"  [FILTERED] {col['name']}: write warm-up < {bounds['min_write_mbs']:g} MB/s, not run again: "
+                    + "; ".join(labels[v] for v in too_slow))
     for line in size_lines(res["variants"], rows, res.get("basis") or "cpu"):
         log("    " + line)
     return res
 
 
-def timing_cells(x, what):
-    """(ms, spread, MB/s) of one variant for "read" or "write": ms = median CPU (or wall) time,
-    MB/s = uncompressed bytes / median wall time."""
-    ms, wall = x.get(f"{what}_ms"), x.get(f"{what}_wall_ms")
+def timing_values(x, what):
+    """(ms, spread, MB/s) of one variant for "read" or "write", None where not measured: ms = median CPU (or wall)
+    time, spread = (max - min) / median (None for a single run), MB/s = uncompressed bytes / median wall time."""
+    ms = x.get(f"{what}_ms")
     if not ms:
+        return None, None, None
+    spread = (x[f"{what}_max"] - x[f"{what}_min"]) / ms if x.get(f"{what}_runs", 0) > 1 else None
+    return ms, spread, mbs(x["uncompressed"], x.get(f"{what}_wall_ms"))
+
+
+def timing_cells(x, what):
+    ms, spread, speed = timing_values(x, what)
+    if ms is None:
         return "-", "-", "-"
-    spread = f"{(x[f'{what}_max'] - x[f'{what}_min']) / ms:.0%}" if x.get(f"{what}_runs", 0) > 1 else "1 run"
-    mbs = f"{x['uncompressed'] / wall / 1000:.0f}" if wall else "-"  # bytes per ms / 1000 = MB/s
-    return f"{ms:.1f}", spread, mbs
+    return f"{ms:.1f}", f"{spread:.0%}" if spread is not None else "1 run", f"{speed:.0f}" if speed is not None else "-"
 
 
 def timed_kinds(variants):
@@ -874,14 +915,12 @@ def timed_kinds(variants):
 
 
 def size_lines(variants, rows, basis="cpu"):
-    """Table of the variants; read/write columns only when measured, A/B shift only with the stability check."""
+    """Table of the variants for the log; read/write columns only when measured."""
     cur = next((x["compressed"] for x in variants if x["current"]), 0)
     kinds = timed_kinds(variants)
-    shifts = any("shift" in x for x in variants)
     head = f"{'compressed':>12} {'bytes/row':>10} {'ratio':>8} {'vs current':>11}"
     for k in kinds:
         head += f" {k + ' ' + basis + ' ms':>14} {'spread':>7} {k + ' MB/s':>10}"
-    head += f" {'A/B pp':>7}" if shifts else ""
     out = [head + "  codec"]
     for x in variants:
         ratio = f"{x['uncompressed'] / x['compressed']:.2f}x" if x["compressed"] else "-"
@@ -889,11 +928,10 @@ def size_lines(variants, rows, basis="cpu"):
         per_row = f"{x['compressed'] / rows:.3f}" if rows else "-"
         line = f"{human_bytes(x['compressed']):>12} {per_row:>10} {ratio:>8} {delta:>11}"
         for k in kinds:
-            ms, spread, mbs = timing_cells(x, k)
-            line += f" {ms:>14} {spread:>7} {mbs:>10}"
-        if shifts:
-            line += f" {x['shift']:>7.1f}" if x.get("shift") is not None else f" {'-':>7}"
-        out.append(f"{line}  {'[' + x['codec'] + ']' if x['current'] else x['codec']}")
+            ms, spread, speed = timing_cells(x, k)
+            line += f" {ms:>14} {spread:>7} {speed:>10}"
+        label = f"[{x['codec']}]" if x["current"] else x["codec"]
+        out.append(f"{line}  {label}" + (f"  (filtered: {x['filtered']})" if x.get("filtered") else ""))
     return out
 
 
@@ -951,14 +989,16 @@ def write_table(name, v):
     return f"{name}_w{v[len(VARIANT.format('')):]}"
 
 
-def write_benchmark(db, w, plan, col, name, labels, runs):
+def write_benchmark(db, w, plan, col, name, labels, runs, uncompressed=None, min_mbs=None):
     """`INSERT … SELECT` of the column alone, per variant into its own table (only that column with that codec,
     no keys). The source is an uncompressed copy of the column in the column table's storage order, so every codec
     compresses exactly the data it stores, and reading the source costs the same for all of them.
     One block = one part per INSERT; TRUNCATE after each run. One warm-up, then `runs` runs, interleaved over the
     variants like the reads; a variant whose warm-up takes longer than WRITE_SLOW_S is not run again and its warm-up
     is its only run (high levels of LZ4HC/ZSTD can take minutes; compression dominates such a run, not caching).
-    Returns (query_times(..., "write"), slow variants)."""
+    With `min_mbs`, a variant whose warm-up writes `uncompressed[v]` bytes slower than that (client-side wall time,
+    so slightly pessimistic) is not run again either.
+    Returns (query_times(..., "write"), slow variants, {too slow variant: warm-up MB/s})."""
     t = plan["table"]
     src = f"{name}_wsrc"
     w.create_table(src, *write_table_body(t, col["type"], "NONE"))
@@ -970,80 +1010,28 @@ def write_benchmark(db, w, plan, col, name, labels, runs):
         w.create_table(write_table(name, v), *write_table_body(t, col["type"], current if v == VARIANT.format(0) else label))
     source = f"{quote_ident(w.database)}.{quote_ident(src)}"
     prefix = f"{name}_write_"
-    slow = set()
+    slow, too_slow = set(), {}
     for r in range(runs + 1):
         for v in labels:
-            if v in slow:
+            if v in slow or v in too_slow:
                 continue
             wt = write_table(name, v)
             secs = w.insert_select(wt, [WRITE_COL], source, "", {**WRITE_SETTINGS, "query_id": f"{prefix}{v}_r{r}"})
             w.truncate(wt)
             if r == 0 and secs > WRITE_SLOW_S:
                 slow.add(v)
+            speed = mbs((uncompressed or {}).get(v, 0), secs * 1000)
+            if r == 0 and min_mbs is not None and speed is not None and speed < min_mbs:
+                too_slow[v] = speed
     for n in [src] + [write_table(name, v) for v in labels]:
         w.drop(n)
-    return query_times(db, prefix, labels, runs, "write", slow), slow
+    return query_times(db, prefix, labels, runs, "write", slow | set(too_slow)), slow, too_slow
 
 
-def half_table(name, half):
-    return f"{name}_{'ab'[half]}"
-
-
-def stability_check(db, w, plan, name, labels, fill_args, fill_exprs, sample):
-    """Sizes on two disjoint halves of the sample (whole series, cityHash64 of the series key, independent of the
-    sipHash64 sampling). One half table at a time. Compares "vs smallest" per codec between the halves."""
-    halves = []
-    for half in (0, 1):
-        hname = half_table(name, half)
-        w.create_as(hname, name)
-        w.insert_select(hname, *fill_args, f"WHERE cityHash64({', '.join(plan['key'])}) % 2 = {half}",
-                        FILL_SETTINGS, exprs=fill_exprs)
-        w.optimize_final(hname)
-        rows = int(db.rows(f"SELECT count() AS rows FROM {quote_ident(w.database)}.{quote_ident(hname)}")[0]["rows"])
-        sizes = {r["name"]: int(r["compressed"]) for r in db.rows(COLUMN_SIZES, {"db": w.database, "t": hname})}
-        w.drop(hname)
-        halves.append((rows, {v: sizes[v] for v in labels}))
-    return compare_halves(labels, *halves)
-
-
-def compare_halves(labels, a, b):
-    """a, b = (rows, {variant: compressed}). Per half, each codec's size vs the smallest codec of that half (%).
-    Contenders (within STABILITY_CONTENDER % of the smallest in either half) get shift = |A - B| in percentage points;
-    any shift > STABILITY_PP flags the column. This also catches a different winner, but not a meaningless swap."""
-    (rows_a, sa), (rows_b, sb) = a, b
-    st = {"rows": (rows_a, rows_b), "shift": {}, "max_shift": None, "smallest": None, "unstable": False, "reasons": []}
-    min_a, min_b = min(sa.values()), min(sb.values())
-    if not (min_a and min_b):
-        st["reasons"].append("a half is empty; not comparable")
-        st["unstable"] = True
-        return st
-    order = list(labels)
-    st["smallest"] = tuple(labels[min((v for v in labels if s[v] == m), key=order.index)]
-                           for s, m in ((sa, min_a), (sb, min_b)))
-    for v, label in labels.items():
-        vs_a, vs_b = (sa[v] / min_a - 1) * 100, (sb[v] / min_b - 1) * 100
-        if min(vs_a, vs_b) <= STABILITY_CONTENDER:
-            st["shift"][label] = abs(vs_a - vs_b)
-    st["max_shift"] = max(((pp, label) for label, pp in st["shift"].items()), key=lambda x: x[0])
-    if st["max_shift"][0] > STABILITY_PP:
-        st["reasons"].append(f"{st['max_shift'][1]} moves {st['max_shift'][0]:.1f} pp vs the smallest codec between "
-                             f"halves (> {STABILITY_PP:g}); smallest A: {st['smallest'][0]}, B: {st['smallest'][1]}")
-    st["unstable"] = bool(st["reasons"])
-    return st
-
-
-def stability_summary(st):
-    msg = f"halves A {st['rows'][0]:,} / B {st['rows'][1]:,} rows"
-    if st["max_shift"]:
-        msg += (f"; {len(st['shift'])} contenders (within {STABILITY_CONTENDER:g}% of the smallest), largest shift "
-                f"{st['max_shift'][0]:.1f} pp ({st['max_shift'][1]}); smallest A: {st['smallest'][0]}, "
-                f"B: {st['smallest'][1]}")
-    return msg
-
-
-def phase2(db, w, plan, sample, sample_rows, read_runs=0, stability=False, results=None, write_runs=0):
+def phase2(db, w, plan, sample, sample_rows, read_runs=0, write_runs=0, bounds=None, results=None, on_result=None):
     """Phase 2, one column at a time. Column-specific server errors skip the column; everything else stops.
-    Results are appended to `results` as they come, so a caller still has them after an abort."""
+    Results are appended to `results` and passed to `on_result` as they come, so a caller still has them after an
+    abort."""
     results = [] if results is None else results
     warned_basis = False
     for i, col in enumerate(plan["bench"], 1):
@@ -1051,8 +1039,7 @@ def phase2(db, w, plan, sample, sample_rows, read_runs=0, stability=False, resul
         log(f"Phase 2: column {i}/{len(plan['bench'])} {col['name']} {col['type']} "
             f"{col['compression_codec'] or '(server default)'}")
         try:
-            results.append(measure_column(db, w, plan, col, name, sample, sample_rows, read_runs, stability,
-                                          write_runs))
+            results.append(measure_column(db, w, plan, col, name, sample, sample_rows, read_runs, write_runs, bounds))
             if results[-1].get("basis") == "wall" and not warned_basis:
                 warned_basis = True
                 log("[WARN] CPU time not reported by the server; read/write times are wall-clock time")
@@ -1062,245 +1049,115 @@ def phase2(db, w, plan, sample, sample_rows, read_runs=0, stability=False, resul
                 raise
             log(f"[FAIL] {col['name']}: code {err[0]}: {err[1]}; column skipped")
             results.append({"column": col["name"], "type": col["type"], "error": f"code {err[0]}: {err[1]}"})
-        for n in [n for n in w.created if n.startswith(name + "_")] + [name]:  # halves, write tables, column table
+        for n in [n for n in w.created if n.startswith(name + "_")] + [name]:  # write tables, column table
             if n in w.created:
                 w.drop(n)
+        if on_result:
+            on_result(results[-1])
     return results
 
 
-# ---------------------------------------------------------------- Phase 3: report
+# ---------------------------------------------------------------- Phase 3: CSV
 
-REPORT_TOP = 10  # per column the report shows the smallest N, the Pareto codecs and the current one
-
-
-def report_meta(w, a, plan):
-    t = plan["table"]
-    return {"run_id": w.run_id, "started": time.time(), "host": plan["host"], "version": plan.get("version", "?"),
-            "database": a.database, "table": a.table, "engine": t["engine"], "where": a.where, "key": plan["key"],
-            "fraction": plan["fraction"], "read_runs": a.read_runs, "write_runs": a.write_runs,
-            "stability": a.stability,
-            "planned": len(plan["bench"]), "source_rows": int(t["total_rows"] or 0),
-            "source_bytes": {c["name"]: int(c["data_compressed_bytes"] or 0) for c in plan["columns"]},
-            "sample_rows": 0, "series": 0, "aborted": None}
+CSV_FIELDS = ["run_id", "column", "type", "codec", "is_current", "rows", "compressed", "uncompressed",
+              "bytes_per_row", "ratio", "vs_current_pct", "read_ms", "read_spread_pct", "read_mb_s", "write_ms",
+              "write_spread_pct", "write_mb_s", "time_basis", "source_compressed", "status"]
 
 
-def pareto(variants):
-    """Codecs that no other codec beats on size and every measured time (median read / write CPU time) at once:
-    at least as good on all, better on one. Only codecs with all measured times take part."""
-    keys = ["compressed"] + [f"{k}_ms" for k in timed_kinds(variants)]
-    if len(keys) == 1:
-        return set()
-    timed = [x for x in variants if all(x.get(k) for k in keys[1:])]
-    return {x["codec"] for x in timed if not any(
-        all(y[k] <= x[k] for k in keys) and any(y[k] < x[k] for k in keys) for y in timed)}
+def num(x, digits):
+    return "" if x is None else round(x, digits)
 
 
-def compact_rows(variants, front):
-    """Variants (sorted by size) the report shows: the smallest REPORT_TOP, the Pareto codecs, the current one."""
-    return [x for i, x in enumerate(variants) if i < REPORT_TOP or x["current"] or x["codec"] in front]
-
-
-def group_rejected(rejected):
-    """[(codec, reason)] -> [(reason, [codecs])], in first-seen order."""
-    groups = {}
-    for codec, reason in rejected:
-        groups.setdefault(reason, []).append(codec)
-    return list(groups.items())
-
-
-def md(text):
-    return str(text).replace("|", "\\|").replace("\n", " ")
-
-
-def duration(secs):
-    secs = int(secs)
-    return f"{secs // 3600}h {secs % 3600 // 60:02d}m {secs % 60:02d}s" if secs >= 3600 else f"{secs // 60}m {secs % 60:02d}s"
-
-
-def render_report(meta, results, now=None):
-    """The markdown report as lines (no log prefix). Only measured facts; no rating, no recommendation."""
-    now = time.time() if now is None else now
-    ok = [r for r in results if not r.get("error")]
-    basis = "wall" if any(r.get("basis") == "wall" for r in ok) else "cpu"
-    kinds = [k for k in ("read", "write") if any(k in timed_kinds(r["variants"]) for r in ok)]
-    ms_head = {k: f"{k} {basis} ms" for k in ("read", "write")}
-    out = [f"===== codec_bench report {meta['run_id']} begin =====", "",
-           f"# codec_bench: `{md(meta['database'])}.{md(meta['table'])}`", ""]
-
-    failed = len(results) - len(ok)
-    status = (f"complete: {len(ok)} of {meta['planned']} columns measured" if not meta["aborted"] else
-              f"**INCOMPLETE** (aborted: {md(meta['aborted'])}): {len(ok)} of {meta['planned']} columns measured")
-    status += f", {failed} failed" if failed else ""
-    time_basis = ("median CPU time (user + system); MB/s from median wall-clock time" if basis == "cpu" else
-                  "median wall-clock time (the server reports no CPU time)")
-    reads = (f"1 warm-up + {meta['read_runs']} runs per codec, single-threaded `SELECT … FORMAT Null`; {time_basis}"
-             if meta["read_runs"] else "off")
-    writes = (f"1 warm-up + {meta['write_runs']} runs per codec (1 run if the warm-up takes > {WRITE_SLOW_S} s), "
-              f"single-threaded `INSERT` of the column alone; {time_basis}" if meta.get("write_runs") else "off")
-    out += ["| | |", "|---|---|",
-            f"| status | {status} |",
-            f"| run | `{meta['run_id']}`, started {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(meta['started']))}, "
-            f"took {duration(now - meta['started'])} |",
-            f"| server | {md(meta['host'])}, ClickHouse {md(meta['version'])} |",
-            f"| table | `{md(meta['database'])}.{md(meta['table'])}`, {md(meta['engine'])}, {meta['source_rows']:,} rows |",
-            f"| filter | {'`' + md(meta['where']) + '`' if meta['where'] else 'none (whole table)'} |",
-            f"| series key | `{md(', '.join(meta['key']))}` |",
-            f"| sample | {meta['sample_rows']:,} rows, {meta['series']:,} series "
-            f"({min(meta['fraction'], 1):.4%} of the series in the filter) |",
-            f"| read benchmark | {reads} |",
-            f"| write benchmark | {writes} |",
-            f"| stability check | {'on (two disjoint halves of the sample)' if meta['stability'] else 'off'} |", ""]
-
-    out += ["## Summary", "",
-            "Sizes per row in the sample. *est. with smallest* is an extrapolation (see Method), not a measurement.", "",
-            "| column | type | current codec | current B/row | smallest codec | B/row | vs current | "
-            + "".join(f"{ms_head[k]} current | {ms_head[k]} smallest | " for k in kinds)
-            + "on disk now | est. with smallest | flags |",
-            "|---|---|---|--:|---|--:|--:|" + "--:|--:|" * len(kinds) + "--:|--:|---|"]
-    for r in results:
-        name, typ = md(r["column"]), md(r["type"])
-        if r.get("error"):
-            out.append(f"| `{name}` | `{typ}` |" + " |" * (7 + 2 * len(kinds)) + " FAILED |")
-            continue
-        cur = next(x for x in r["variants"] if x["current"])
-        best = r["variants"][0]
-        rows = r["rows"] or 0
-        per_row = lambda x: f"{x['compressed'] / rows:.3f}" if rows else "-"
-        ms = lambda x, k: f"{x[k + '_ms']:.1f}" if x.get(k + "_ms") else "-"
-        src = meta["source_bytes"].get(r["column"], 0)
-        est = human_bytes(src * best["compressed"] / cur["compressed"]) if src and cur["compressed"] else "-"
-        delta = f"{(best['compressed'] - cur['compressed']) / cur['compressed']:+.1%}" if cur["compressed"] else "-"
-        st = r.get("stability") or {}
-        flags = (["UNSTABLE"] if st.get("unstable") else []) + (["stability check failed"] if st.get("error") else [])
-        flags += ["write benchmark failed"] if r.get("write_error") else []
-        flags += [f"{len(r['warnings'])} warning(s)"] if r.get("warnings") else []
-        smallest = "(current)" if best["current"] else f"`{md(best['codec'])}`"
-        out.append(f"| `{name}` | `{typ}` | `{md(r['current'] or '(server default)')}` | {per_row(cur)} | {smallest} "
-                   f"| {per_row(best)} | {delta} | " + "".join(f"{ms(cur, k)} | {ms(best, k)} | " for k in kinds)
-                   + f"{human_bytes(src) if src else '-'} | {est} | {', '.join(flags)} |")
-    out.append("")
-
-    for r in results:
-        out += [f"## `{md(r['column'])}` {md(r['type'])}", ""]
-        if r.get("error"):
-            out += [f"**FAILED**: {md(r['error'])}", ""]
-            continue
-        variants, rows = r["variants"], r["rows"] or 0
-        front = pareto(variants)
-        shown = compact_rows(variants, front)
-        shifts = any("shift" in x for x in variants)
-        out.append(f"Current codec: `{md(r['current'] or '(server default)')}`. {len(variants)} codecs measured "
-                   f"on {rows:,} rows, {len(r['rejected'])} rejected by the server, "
-                   f"{len(r['duplicates'])} identical to another one.")
-        out.append("")
-        head = "| codec | compressed | B/row | ratio | vs current |"
-        align = "|---|--:|--:|--:|--:|"
-        for k in kinds:
-            head += f" {ms_head[k]} | {k} spread | {k} MB/s |"
-            align += "--:|--:|--:|"
-        if kinds:
-            head += " Pareto |"
-            align += ":-:|"
-        if shifts:
-            head += " A/B pp |"
-            align += "--:|"
-        out += [head, align]
-        cur = next(x["compressed"] for x in variants if x["current"])
-        for x in shown:
-            label = f"**current** `{md(x['codec'][len('current '):])}`" if x["current"] else f"`{md(x['codec'])}`"
-            ratio = f"{x['uncompressed'] / x['compressed']:.2f}x" if x["compressed"] else "-"
-            delta = f"{(x['compressed'] - cur) / cur:+.1%}" if cur else "-"
-            line = (f"| {label} | {human_bytes(x['compressed'])} | {x['compressed'] / rows if rows else 0:.3f} "
-                    f"| {ratio} | {delta} |")
-            for k in kinds:
-                line += " " + " | ".join(timing_cells(x, k)) + " |"
-            if kinds:
-                line += f" {'✓' if x['codec'] in front else ''} |"
-            if shifts:
-                line += f" {x['shift']:.1f} |" if x.get("shift") is not None else " - |"
-            out.append(line)
-        if len(shown) < len(variants):
-            more = len(variants) - len(shown)
-            out += ["", f"{more} more codec{'s' if more > 1 else ''} in the log above (size table of "
-                        f"`{md(r['column'])}`)."]
-        out.append("")
-        if r["duplicates"]:
-            out.append("Identical to another codec (same server spelling), not measured twice: "
-                       + "; ".join(f"`{md(a)}` = `{md(b)}`" for a, b in r["duplicates"]) + ".")
-            out.append("")
-        if r["rejected"]:
-            out.append(f"Rejected by the server ({len(r['rejected'])}):")
-            out += [f"- {', '.join('`' + md(c) + '`' for c in codecs)}: {md(reason)}"
-                    for reason, codecs in group_rejected(r["rejected"])]
-            out.append("")
-        if r.get("write_error"):
-            out += [f"Write benchmark failed: {md(r['write_error'])}", ""]
-        if r.get("write_slow"):
-            out += [f"Write measured once (warm-up > {WRITE_SLOW_S} s): "
-                    + ", ".join(f"`{md(c)}`" for c in r["write_slow"]) + ".", ""]
-        st = r.get("stability")
-        if st and st.get("error"):
-            out += [f"Stability check failed: {md(st['error'])}", ""]
-        elif st:
-            verdict = "**UNSTABLE**: " + md("; ".join(st["reasons"])) if st["unstable"] else "Stable."
-            out += [f"Stability: {md(stability_summary(st))}. {verdict}", ""]
-        if r.get("warnings"):
-            out += ["Warnings:"] + [f"- {md(w)}" for w in r["warnings"]] + [""]
-
-    out += ["## Method", "",
-            "- **Sample**: whole series picked by `sipHash64(<series key>)`, copied into a table with the same engine, "
-            "ORDER BY, PARTITION BY and settings, then `OPTIMIZE FINAL`.",
-            "- **Sizes**: per column one table with the key columns and one copy of the column per codec, filled from "
-            "the sample, `OPTIMIZE FINAL`, sizes from `system.columns`. *vs current* compares with the current codec, "
-            "measured the same way on the same rows.",
-            "- **Read**: `SELECT <copy> FORMAT Null` with `max_threads = 1`, uncompressed and query cache off; the "
-            "data is in the OS page cache, so this measures decompression, not disk.",
-            "- **Write**: per codec a table with only this column and codec (plain MergeTree, no keys, the source's "
-            "table settings), `INSERT … SELECT` of the column from an uncompressed copy in the order the column "
-            "table stores it, `max_threads = 1`, one block = one part, `TRUNCATE` after each run. Reading the copy, "
-            "squashing and writing the part cost the same for every codec (the `NONE` row shows that base); the "
-            "difference between codecs is compression. Merges are not measured: they decompress and recompress "
-            "each column again, plus work that is the same for every codec.",
-            "- **Times**: *CPU ms* = median user + system CPU time of the query, what the codec costs the node "
-            "(sums over its threads; with one thread close to busy time). *MB/s* = uncompressed bytes / median "
-            "wall-clock time of the query, the speed a client sees; it also contains waiting (I/O, scheduler), so "
-            "it is noisier on a busy node. Medians after one warm-up; *spread* = (max − min) / median of the "
-            "CPU times. Without CPU time from the server (e.g. macOS) both use wall-clock time.",
-            "- **Pareto ✓**: no other codec is at least as small and at least as fast on every measured time "
-            "(median read and write CPU ms) and better on one; inherits the noise of the times.",
-            "- **est. with smallest**: the column's compressed size in the source table × (smallest / current) in "
-            "the sample. An extrapolation from the sample, not a measurement. *-* when the server keeps no "
-            "per-column sizes for the source (compact parts).",
-            "- **Stability** (if on): sizes on two disjoint halves of the sample (whole series, `cityHash64`). "
-            f"Contenders = within {STABILITY_CONTENDER:g} % of the smallest codec in either half; *A/B pp* = how far "
-            "a contender's size vs the smallest moves between the halves. UNSTABLE if any moves more than "
-            f"{STABILITY_PP:g} pp.",
-            "- Not tried: codecs the server rejected (listed per column).", "",
-            f"===== codec_bench report {meta['run_id']} end ====="]
+def csv_rows(res, run_id, source_compressed=None):
+    """CSV rows (dicts) of one column result: measured codecs sorted by size, then same / rejected / excluded ones
+    (their measurement cells empty); a failed column is one row with an empty codec. Empty cell = not measured."""
+    base = {"run_id": run_id, "column": res["column"], "type": res["type"],
+            "source_compressed": source_compressed if source_compressed else ""}
+    if res.get("error"):
+        return [{**base, "status": f"column failed: {res['error']}"}]
+    rows, basis = res["rows"] or 0, res.get("basis", "")
+    cur = next((x["compressed"] for x in res["variants"] if x["current"]), 0)
+    out = []
+    for x in res["variants"]:
+        status = [f"filtered: {x['filtered']}"] if x.get("filtered") else []
+        if res.get("write_error") and not x.get("write_ms"):
+            status.append(f"write benchmark failed: {res['write_error']}")
+        row = {**base, "codec": (res["current"] or "")[len("CODEC("):-1] or "(server default)" if x["current"]
+               else x["codec"], "is_current": int(x["current"]), "rows": rows, "compressed": x["compressed"],
+               "uncompressed": x["uncompressed"], "bytes_per_row": num(x["compressed"] / rows if rows else None, 4),
+               "ratio": num(x["uncompressed"] / x["compressed"] if x["compressed"] else None, 3),
+               "vs_current_pct": num((x["compressed"] - cur) / cur * 100 if cur else None, 2),
+               "time_basis": basis if timed_kinds([x]) else "", "status": "; ".join(status) or "ok"}
+        for k in ("read", "write"):
+            ms, spread, speed = timing_values(x, k)
+            row.update({f"{k}_ms": num(ms, 3), f"{k}_spread_pct": num(spread * 100 if spread is not None else None, 1),
+                        f"{k}_mb_s": num(speed, 1)})
+        out.append(row)
+    out += [{**base, "codec": c, "is_current": 0,
+             "status": f"same as {'current' if same.startswith('current ') else same}"} for c, same in res["duplicates"]]
+    out += [{**base, "codec": c, "is_current": 0, "status": f"rejected: {why}"} for c, why in res["rejected"]]
+    out += [{**base, "codec": c, "is_current": 0, "status": "excluded"} for c in res.get("excluded", [])]
     return out
 
 
-def print_report(meta, results):
-    """Plain print (no timestamps) so the block between the markers is clean markdown."""
-    sys.stdout.write("\n".join(render_report(meta, results)) + "\n")
-    sys.stdout.flush()
+class CsvOut:
+    """The CSV file: header on open, then all rows of one column at a time, flushed, so an aborted run leaves the
+    finished columns."""
 
+    def __init__(self, path, run_id, source_bytes):
+        self.path, self.run_id, self.source_bytes = path, run_id, source_bytes
+        self.file = open(path, "w", newline="", encoding="utf-8")
+        self.writer = csv.DictWriter(self.file, CSV_FIELDS, restval="")
+        self.writer.writeheader()
+        self.file.flush()
+
+    def append(self, res):
+        self.writer.writerows(csv_rows(res, self.run_id, self.source_bytes.get(res["column"])))
+        self.file.flush()
+
+    def close(self):
+        self.file.close()
+
+
+def default_csv(run_id):
+    return os.path.join(tempfile.gettempdir(), f"codec_bench_{run_id}.csv")
+
+
+def bounds_of(a):
+    return {"include": a.include_codec, "exclude": a.exclude_codec, "min_read_mbs": a.min_read_mbs,
+            "min_write_mbs": a.min_write_mbs}
+
+
+def linger(path, secs):
+    """Keep the pod alive so the CSV can be copied out; Ctrl-C / SIGTERM ends the wait."""
+    pod = os.environ.get("HOSTNAME", "<pod>")
+    log(f"CSV: {path}; copy it within {secs}s, e.g. kubectl cp <namespace>/{pod}:{path} ./{os.path.basename(path)}")
+    previous = install_signal_handlers()
+    try:
+        time.sleep(secs)
+    except (Interrupted, KeyboardInterrupt):
+        log("linger ended by signal")
+    finally:
+        restore_signal_handlers(previous)
 
 def run(db, w, a, plan):
     """Everything after the dry run. Own tables are always dropped; on interrupt the running query is killed first."""
     previous = install_signal_handlers()
-    meta = report_meta(w, a, plan)
-    results = []
+    results, out = [], None
+    t = plan["table"]
     try:
+        out = CsvOut(a.csv or default_csv(w.run_id), w.run_id,
+                     {c["name"]: int(c["data_compressed_bytes"] or 0) for c in plan["columns"]})
+        log(f"run {w.run_id}: {plan['host']} ClickHouse {plan.get('version', '?')}; {a.database}.{a.table} "
+            f"{t['engine']} {int(t['total_rows'] or 0):,} rows; where {a.where or '-'}; series key "
+            f"({', '.join(plan['key'])}); read runs {a.read_runs}, write runs {a.write_runs}; bounds: {bounds_text(a)}; "
+            f"CSV {out.path}")
         drop_leftovers(w)
-        sample, meta["sample_rows"], meta["series"] = build_sample(db, w, a, plan)
-        phase2(db, w, plan, sample, meta["sample_rows"], a.read_runs, a.stability, results, a.write_runs)
+        sample, sample_rows, _ = build_sample(db, w, a, plan)
+        phase2(db, w, plan, sample, sample_rows, a.read_runs, a.write_runs, bounds_of(a), results, out.append)
         failed = [r["column"] for r in results if r.get("error")]
-        unstable = [r["column"] for r in results if (r.get("stability") or {}).get("unstable")]
         log(f"Phase 2 done: {len(results) - len(failed)}/{len(results)} columns measured"
-            + (f", failed: {', '.join(failed)}" if failed else "")
-            + (f", unstable: {', '.join(unstable)}" if unstable else ""))
-        print_report(meta, results)
+            + (f", failed: {', '.join(failed)}" if failed else "") + f"; CSV {out.path}")
         return 0
     except BaseException as e:
         ignore_signals()
@@ -1309,12 +1166,8 @@ def run(db, w, a, plan):
             w.kill_running()
         except Exception as k:  # cleanup must go on
             log(f"KILL QUERY failed: {k}")
-        if results:
-            try:
-                meta["aborted"] = f"{type(e).__name__}: {e}"
-                print_report(meta, results)
-            except Exception as r:  # a report bug must not stop the cleanup
-                log(f"[WARN] partial report failed: {type(r).__name__}: {r}")
+        if out:
+            log(f"CSV {out.path} holds the {len(results)} column(s) finished before the abort")
         return 130 if isinstance(e, (Interrupted, KeyboardInterrupt)) else 1
     finally:
         ignore_signals()
@@ -1324,6 +1177,8 @@ def run(db, w, a, plan):
                 log(f"dropped {w.database}.{name}")
             except Exception as e:
                 log(f"[WARN] could not drop {w.database}.{name}: {e}; run --cleanup")
+        if out:
+            out.close()
         restore_signal_handlers(previous)
 
 
@@ -1350,8 +1205,18 @@ def parse_args(argv=None):
     ap.add_argument("--write-runs", type=int, default=3,
                     help=f"write benchmark runs per codec after 1 warm-up (1 run if the warm-up takes > "
                          f"{WRITE_SLOW_S}s); 0 = off")
-    ap.add_argument("--stability", action="store_true",
-                    help="also measure sizes on two disjoint halves of the sample and flag unstable columns")
+    ap.add_argument("--include-codec", action="append", default=[], metavar="PATTERN",
+                    help="only codecs matching this glob, e.g. 'ZSTD*' (repeatable; case and spaces ignored)")
+    ap.add_argument("--exclude-codec", action="append", default=[], metavar="PATTERN",
+                    help="skip codecs matching this glob, e.g. 'ZSTD(19)' or 'FPC*' (repeatable); the current codec "
+                         "is always measured")
+    ap.add_argument("--min-read-mbs", type=float, help="mark codecs with a median read speed below this as filtered "
+                                                       "(they are not write-benchmarked)")
+    ap.add_argument("--min-write-mbs", type=float, help="stop write-benchmarking a codec whose warm-up is slower than "
+                                                        "this; it is marked filtered")
+    ap.add_argument("--csv", help="CSV output file (default: <tmp>/codec_bench_<run>.csv)")
+    ap.add_argument("--linger", type=int, default=0, metavar="SECONDS",
+                    help="after the run, wait this long so the CSV can be copied out of the pod")
     ap.add_argument("--yes", action="store_true", help="run for real (default: dry run)")
     ap.add_argument("--cleanup", action="store_true", help="only drop leftover scratch tables, then exit")
     a = ap.parse_args(argv)
@@ -1361,6 +1226,8 @@ def parse_args(argv=None):
         ap.error("--read-runs must be >= 0")
     if a.write_runs < 0:
         ap.error("--write-runs must be >= 0")
+    if a.linger < 0:
+        ap.error("--linger must be >= 0")
     return a
 
 
@@ -1385,7 +1252,10 @@ def main(argv=None):
     run_id = new_run_id()
     log(f"run {run_id}: Phase 1 (sample) on {plan['host']}")
     w = Writer(db.client, plan["scratch_db"], plan["host"], run_id, kill_client=lambda: connect(a).client)
-    return run(db, w, a, plan)
+    code = run(db, w, a, plan)
+    if a.linger:
+        linger(a.csv or default_csv(run_id), a.linger)
+    return code
 
 
 if __name__ == "__main__":
